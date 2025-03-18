@@ -1,64 +1,151 @@
-wp_localize_script('booking-admin-js', 'my_booking_nonce', [
-    'nonce' => wp_create_nonce('wp_rest')
-]);
-function enqueue_admin_booking_script() {
-    wp_enqueue_script('booking-admin-js', get_template_directory_uri() . '/js/booking-admin.js', array('jquery'), null, true);
-    wp_localize_script('booking-admin-js', 'myBookingData', [
-        'nonce' => wp_create_nonce('wp_rest')
-    ]);
-}
-add_action('admin_enqueue_scripts', 'enqueue_admin_booking_script');
-
-if (defined('LSCWP_V')) {
-    do_action('litespeed_purge_all');
-}
-
 function create_woocommerce_order_from_elementor_form($record, $handler) {
-    $form_name = $record->get_form_settings('form_name');
-    if ('your_form_name' !== $form_name) {
+    error_log('Elementor form submission detected.');
+    $form_id = $record->get_form_settings('id');
+    error_log('Submitted Form ID: ' . $form_id);
+    if ('XXX' !== $form_id) {
+        error_log('Form ID does not match.');
+        return;
+    }
+    error_log('Form ID matched.');
+
+    $raw_fields = $record->get('fields');
+    error_log(print_r($raw_fields, true));
+    $fields = [];
+    foreach ($raw_fields as $key => $field) {
+        $fields[$key] = isset($field['value']) ? sanitize_text_field($field['value']) : '';
+    }
+	
+    if (
+        !isset($fields['email']) || trim($fields['email']) === '' ||
+        !isset($fields['full_name']) || trim($fields['full_name']) === '' ||
+        !isset($fields['phone']) || trim($fields['phone']) === ''
+    ) {
+        error_log('Missing required fields: email, full_name, or phone.');
         return;
     }
 
-    $raw_fields = $record->get('fields');
-    $fields = [];
-    foreach ($raw_fields as $id => $field) {
-        $fields[$id] = sanitize_text_field($field['value']); // Sanitize input
-    }
-
+    $full_name = $fields['full_name'];
+    $name_parts = explode(' ', $full_name, 2);
+    $first_name = $name_parts[0];
+    $last_name  = isset($name_parts[1]) ? $name_parts[1] : '';
     $customer_id = email_exists($fields['email']);
     if ($customer_id) {
         $customer = new WC_Customer($customer_id);
     } else {
         $customer = new WC_Customer();
         $customer->set_email($fields['email']);
-        $customer->set_first_name($fields['first_name']);
-        $customer->set_last_name($fields['last_name']);
+        $customer->set_first_name($first_name);
+        $customer->set_last_name($last_name);
         $customer->set_billing_phone($fields['phone']);
         $customer->save();
     }
 
     $order = wc_create_order(['customer_id' => $customer->get_id()]);
-    $product_id = PRODUCT_ID;
+    $product_id = XXX;
     $product = wc_get_product($product_id);
     if ($product) {
         $order->add_product($product, 1);
+    } else {
+        error_log('Product not found.');
+    }
+
+    $booking_cost = floatval($fields['my_hidden_cost_field']);
+    if ($booking_cost > 0) {
+        $fee = new WC_Order_Item_Fee();
+        $fee->set_name('עלות הזמנה');
+        $fee->set_amount($booking_cost);
+        $fee->set_total($booking_cost);
+        $order->add_item($fee);
+    }
+
+    if (!empty($fields['my_hidden_date_field'])) {
+        $order->update_meta_data('booking_dates', $fields['my_hidden_date_field']);
+		$dates_array = [];
+    $dates_range = explode(' עד ', $fields['my_hidden_date_field']);
+    
+    if (count($dates_range) === 2) {
+        $start_date = new DateTime(trim($dates_range[0]));
+        $end_date = new DateTime(trim($dates_range[1]));
+
+        while ($start_date <= $end_date) {
+            $dates_array[] = $start_date->format('Y-m-d');
+            $start_date->modify('+1 day');
+        }
+    } else {
+        $dates_array[] = trim($fields['my_hidden_date_field']);
+    }
+
+    error_log('Parsed booking dates: ' . print_r($dates_array, true));
+
+    $response = wp_remote_post(
+        home_url('/wp-json/booking/v1/update-blocked-dates'),
+        [
+            'method'    => 'POST',
+            'headers'   => ['Content-Type' => 'application/json'],
+            'body'      => json_encode(['blocked_dates' => $dates_array]),
+            'timeout'   => 10,
+        ]
+    );
+
+    if (is_wp_error($response)) {
+        error_log('Failed to update blocked dates: ' . $response->get_error_message());
+    } else {
+        error_log('Blocked dates updated successfully.');
+    }
+    }
+    if (!empty($fields['guests_number'])) {
+        $order->update_meta_data('guests_number', $fields['guests_number']);
+    }
+    if (!empty($fields['about_you'])) {
+        $order->update_meta_data('booking_notes', $fields['about_you']);
     }
 
     $billing_address = [
-        'first_name' => $fields['first_name'],
-        'last_name'  => $fields['last_name'],
+        'first_name' => $first_name,
+        'last_name'  => $last_name,
         'email'      => $fields['email'],
         'phone'      => $fields['phone'],
     ];
     $order->set_address($billing_address, 'billing');
-
     $order->calculate_totals();
-    $order->update_status('processing', 'Order created from Elementor form submission.', true);
+    $order->update_status('on-hold', 'Order created from Elementor form submission.', true);
+    $order_note = "פרטי הזמנה:\nתאריכים: {$fields['my_hidden_date_field']}\nמספר אורחים: {$fields['guests_number']}\nקצת על מטרת הנסיעה: {$fields['about_you']}\nעלות: {$fields['my_hidden_cost_field']}";
+    $order->add_order_note($order_note);
+    if (isset(WC()->mailer()->emails['WC_Email_New_Order'])) {
+        WC()->mailer()->emails['WC_Email_New_Order']->trigger($order->get_id());
+    }
 
-    wc_reduce_stock_levels($order->get_id());
-    WC()->mailer()->emails['WC_Email_New_Order']->trigger($order->get_id());
+    error_log('Order created successfully: ' . $order->get_id());
 }
 add_action('elementor_pro/forms/new_record', 'create_woocommerce_order_from_elementor_form', 10, 2);
+
+add_action('woocommerce_order_status_changed', function($order_id, $old_status, $new_status) {
+    if (in_array($new_status, ['cancelled', 'refunded'])) {
+        $order = wc_get_order($order_id);
+        $booking_dates = $order->get_meta('booking_dates');
+
+        if (!empty($booking_dates)) {
+            $dates_array = explode(',', $booking_dates);
+            error_log('Releasing blocked dates: ' . print_r($dates_array, true));
+
+            $response = wp_remote_post(
+                home_url('/wp-json/booking/v1/update-blocked-dates'),
+                [
+                    'method'    => 'POST',
+                    'headers'   => ['Content-Type' => 'application/json'],
+                    'body'      => json_encode(['blocked_dates' => $dates_array, 'release' => true]),
+                    'timeout'   => 10,
+                ]
+            );
+
+            if (is_wp_error($response)) {
+                error_log('Failed to release blocked dates: ' . $response->get_error_message());
+            } else {
+                error_log('Blocked dates released successfully.');
+            }
+        }
+    }
+}, 10, 3);
 
 function load_easepick_admin_assets() {
     wp_enqueue_style('easepick-css', 'https://cdn.jsdelivr.net/npm/@easepick/bundle@1.2.0/dist/index.css');
@@ -107,8 +194,8 @@ function update_blocked_dates_api(WP_REST_Request $request) {
 add_action('admin_menu', 'register_booking_calendar_admin_page');
 function register_booking_calendar_admin_page() {
     add_menu_page(
-        'ניהול יומן', 
-        'ניהול יומן', 
+        'ניהול יומן פאפוס', 
+        'ניהול יומן פאפוס', 
         'manage_woocommerce', 
         'booking-calendar-management', 
         'render_booking_calendar_admin_page',
@@ -122,11 +209,11 @@ function render_booking_calendar_admin_page() {
     }
     ?>
     <div class="wrap">
-        <h1>ניהול יומן דינמי</h1>
+        <h1>ניהול יומן פאפוס</h1>
         <div id="admin-easepick-calendar" style="max-width: 350px;"></div>
         <p id="selected-dates-display" style="margin-top:10px; font-weight:bold;"></p>
         <button id="lock-dates-btn" class="button button-primary">נעילת תאריכים</button>
-        <button id="unlock-dates-btn" class="button button-secondary">שחרר תאריכים</button>
+        <button id="unlock-dates-btn" class="button button-secondary">שחרור תאריכים</button>
     </div>
     <script type="text/javascript">
     document.addEventListener("DOMContentLoaded", function () {
@@ -159,7 +246,7 @@ function render_booking_calendar_admin_page() {
         headers: {
             'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ blocked_dates: selectedDates }) // ודא שזה מערך
+        body: JSON.stringify({ blocked_dates: selectedDates })
     });
     const data = await response.json();
     console.log("✅ Blocked dates updated:", data);
