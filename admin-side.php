@@ -120,28 +120,45 @@ function create_woocommerce_order_from_elementor_form($record, $handler) {
 add_action('elementor_pro/forms/new_record', 'create_woocommerce_order_from_elementor_form', 10, 2);
 
 add_action('woocommerce_order_status_changed', function($order_id, $old_status, $new_status) {
-    if (in_array($new_status, ['cancelled', 'refunded'])) {
+	if (in_array($new_status, ['cancelled', 'refunded'])) {
         $order = wc_get_order($order_id);
-        $booking_dates = $order->get_meta('booking_dates');
+		$booking_dates = $order->get_meta('booking_dates');
 
         if (!empty($booking_dates)) {
-            $dates_array = explode(',', $booking_dates);
-            error_log('Releasing blocked dates: ' . print_r($dates_array, true));
+            $date_range = explode(' עד ', $booking_dates);
+            if (count($date_range) === 2) {
+                $start_date = $date_range[0];
+                $end_date = $date_range[1];
 
-            $response = wp_remote_post(
-                home_url('/wp-json/booking/v1/update-blocked-dates'),
-                [
-                    'method'    => 'POST',
-                    'headers'   => ['Content-Type' => 'application/json'],
-                    'body'      => json_encode(['blocked_dates' => $dates_array, 'release' => true]),
-                    'timeout'   => 10,
-                ]
-            );
+                $dates_to_release = [];
+                $current_date = strtotime($start_date);
+                $end_date = strtotime($end_date);
 
-            if (is_wp_error($response)) {
-                error_log('Failed to release blocked dates: ' . $response->get_error_message());
+                while ($current_date <= $end_date) {
+                    $dates_to_release[] = date('Y-m-d', $current_date);
+                    $current_date = strtotime('+1 day', $current_date);
+                }
+
+                $response = wp_remote_post(
+                    home_url('/wp-json/booking/v1/update-blocked-dates'),
+                    [
+                        'method'    => 'POST',
+                        'headers'   => ['Content-Type' => 'application/json'],
+                        'body'      => json_encode([
+                            'blocked_dates' => $dates_to_release,
+                            'release' => true
+                        ]),
+                        'timeout'   => 10,
+                    ]
+                );
+
+                if (is_wp_error($response)) {
+                    error_log('Failed to release blocked dates: ' . $response->get_error_message());
+                } else {
+                    error_log('Blocked dates released successfully.');
+                }
             } else {
-                error_log('Blocked dates released successfully.');
+                error_log('Invalid booking dates format: ' . $booking_dates);
             }
         }
     }
